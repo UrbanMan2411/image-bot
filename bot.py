@@ -63,6 +63,45 @@ SYSTEM_PROMPT = """You are an image generation AI. Generate images based on user
 Create stunning, detailed, visually appealing images that match the description."""
 
 
+async def extract_frame_from_url(video_url: str) -> bytes | None:
+    """Extract a frame from video URL using ffmpeg."""
+    try:
+        import subprocess
+        tmp_video = f"/tmp/video-{uuid.uuid4().hex[:8]}.mp4"
+        tmp_frame = f"/tmp/frame-{uuid.uuid4().hex[:8]}.jpg"
+
+        # Download video
+        async with aiohttp.ClientSession() as session:
+            async with session.get(video_url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status != 200:
+                    return None
+                with open(tmp_video, 'wb') as f:
+                    f.write(await resp.read())
+
+        # Extract frame at 2 seconds
+        result = subprocess.run(
+            ["ffmpeg", "-i", tmp_video, "-ss", "00:00:02", "-frames:v", "1", "-y", tmp_frame],
+            capture_output=True, timeout=15,
+        )
+
+        if result.returncode == 0 and os.path.exists(tmp_frame):
+            with open(tmp_frame, 'rb') as f:
+                data = f.read()
+            os.remove(tmp_video)
+            os.remove(tmp_frame)
+            return data
+
+        # Cleanup
+        for f in [tmp_video, tmp_frame]:
+            if os.path.exists(f):
+                os.remove(f)
+        return None
+
+    except Exception as e:
+        logger.error(f"Frame extraction failed: {e}")
+        return None
+
+
 def check_rate(user_id: int) -> bool:
     global last_reset
     if (datetime.now() - last_reset) > timedelta(days=1):
@@ -269,6 +308,37 @@ async def handle_request(message: Message):
         await message.answer("Опиши что нарисовать 🎨")
         return
 
+    # Check for video URL — extract frame as reference
+    import re as _re
+    video_match = _re.search(r'https?://\S+\.(mp4|mov|avi|webm|gif)', prompt, _re.I)
+    if video_match:
+        if not check_rate(uid):
+            await message.answer(f"⚠️ Дневной лимит ({MAX_PER_DAY}). Попробуй завтра.")
+            return
+        if user_locks[uid]:
+            await message.answer("⏳ Подожди...")
+            return
+        user_locks[uid] = True
+        status = await message.answer("🎬 Извлекаю кадр из видео...")
+        try:
+            frame = await extract_frame_from_url(video_match.group(0))
+            if frame:
+                user_daily_count[uid] += 1
+                await status.delete()
+                await message.answer_photo(
+                    photo=BufferedInputFile(frame, filename="frame.jpg"),
+                    caption="📸 <b>Кадр из видео</b>\n\nТеперь опиши что сгенерировать на основе этого референса 👇",
+                    parse_mode="HTML",
+                )
+            else:
+                await status.edit_text("❌ Не удалось извлечь кадр. Проверь ссылку.")
+        except Exception as e:
+            await status.edit_text(f"❌ Ошибка: {e}")
+        finally:
+            user_locks[uid] = False
+        return
+
+    # Regular image generation
     if not check_rate(uid):
         await message.answer(f"⚠️ Дневной лимит ({MAX_PER_DAY}). Попробуй завтра.")
         return
